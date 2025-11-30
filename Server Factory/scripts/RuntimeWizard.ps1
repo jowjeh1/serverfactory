@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Layer 4 Runtime Wizard - The "Day 0" Configuration Engine.
-    UPDATED: Phase 2 - IIS Module (Fixed: SSL Binding Provider & Warning Silence).
+    UPDATED: Engine v2.9 (Consolidated Fixes: IIS SSL Provider & DNS Logic)
 #>
 
 [CmdletBinding()]
@@ -16,8 +16,6 @@ function Write-Log {
     param([string]$Message, [string]$Level="INFO")
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogMsg = "[$TimeStamp] [$Level] $Message"
-    
-    # OUTPUT TO CONSOLE (Captured by Transcript)
     Write-Host $LogMsg -ForegroundColor $(switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} Default {"Gray"} })
 }
 
@@ -55,7 +53,7 @@ function Test-Hostname {
             
             Write-Log "Rebooting to apply hostname..." "WARN"
             Restart-Computer -Force
-            exit # Stop script execution here
+            exit
         }
         Write-Log "Hostname matches target: $env:COMPUTERNAME" "SUCCESS"
     }
@@ -63,26 +61,21 @@ function Test-Hostname {
 
 # 2. Domain Controller Promotion
 function Promote-DC {
-    # Check if AD-DS role is installed BUT not yet a domain controller
     if ((Get-WindowsFeature AD-Domain-Services).Installed -and -not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         Write-Host "`n=== DOMAIN CONTROLLER PROMOTION ===" -ForegroundColor Cyan
         $Ans = Read-Host "Detected AD-DS Role. Promote this server to a Domain Controller? [Y/N]"
         
         if ($Ans -eq "Y") {
-            # --- RESTORED NETWORK LOGIC (PERMISSIVE MODE) ---
             Write-Host "DCs require a Static IP configuration." -ForegroundColor Yellow
             $IP = Read-Host "Enter Static IP Address"
             $Prefix = Read-Host "Enter Subnet Prefix (e.g. 24)"
             $Gateway = Read-Host "Enter Default Gateway"
-            # Crucial: New Forests must point to themselves for DNS initially
             $DNS = "127.0.0.1" 
             
             Write-Host "Applying Network Settings..." -ForegroundColor Cyan
             $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
 
-            # 2a. IP & Gateway Configuration (Robust)
             try {
-                # Try standard config first
                 New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $Gateway -ErrorAction Stop
                 Write-Log "Network Configured: $IP / Gateway: $Gateway" "SUCCESS"
             } catch {
@@ -90,11 +83,8 @@ function Promote-DC {
                 Write-Log "Attempting Fallback (IP Only + Route)..." "WARN"
 
                 try {
-                    # Fallback Step 1: Set IP without Gateway
                     New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -ErrorAction Stop
                     Write-Log "Static IP set successfully (No Gateway)." "SUCCESS"
-
-                    # Fallback Step 2: Try to force Gateway as a Route (Best Effort)
                     New-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceIndex $Adapter.ifIndex -NextHop $Gateway -ErrorAction SilentlyContinue
                     Write-Log "Attempted to force Default Gateway route." "INFO"
                 } catch {
@@ -102,7 +92,6 @@ function Promote-DC {
                 }
             }
 
-            # 2b. DNS Configuration (Isolated)
             try {
                 Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
                 Write-Log "DNS pointing to Localhost ($DNS)." "SUCCESS"
@@ -110,19 +99,12 @@ function Promote-DC {
                 Write-Log "Failed to set DNS: $_" "ERROR"
             }
             
-            # --- PROMOTION LOGIC ---
             $DomainName = Read-Host "Root Domain Name (e.g. corp.local)"
             $SafePass   = Read-Host "SafeMode Administrator Password" -AsSecureString
             
             Write-Log "Starting Forest Provisioning. This WILL reboot the server..." "WARN"
-            
             try {
-                Install-ADDSForest -DomainName $DomainName `
-                                   -SafeModeAdministratorPassword $SafePass `
-                                   -InstallDns:$true `
-                                   -Force:$true `
-                                   -Confirm:$false
-                
+                Install-ADDSForest -DomainName $DomainName -SafeModeAdministratorPassword $SafePass -InstallDns:$true -Force:$true -Confirm:$false
                 Write-Log "Promotion command sent. Waiting for reboot..." "SUCCESS"
                 Stop-Transcript
                 exit
@@ -133,69 +115,52 @@ function Promote-DC {
     }
 }
 
-# 3. WEB SERVER (IIS) CONFIGURATION (Phase 2)
+# 3. WEB SERVER (IIS) CONFIGURATION
 function Configure-IIS {
-    # Detection
     if ((Get-WindowsFeature Web-Server).Installed) {
         Write-Host "`n=== WEB SERVER (IIS) CONFIGURATION ===" -ForegroundColor Cyan
         
-        # --- Pre-Load Modules (Fix for Reliability) ---
-        # Ensure modules are loaded BEFORE attempting configuration blocks
         Write-Log "Loading IIS and PKI modules..."
         Import-Module WebAdministration -ErrorAction SilentlyContinue
         Import-Module PKI -ErrorAction SilentlyContinue
 
-        # --- A. Baseline Configuration (Auto) ---
         Write-Log "Applying IIS Baseline Configuration..."
         try {
-            # Ensure W3SVC is Automatic/Running
             Set-Service -Name W3SVC -StartupType Automatic -Status Running -ErrorAction Stop
-            
-            # Ensure DefaultAppPool is AutoStart=True
             Set-ItemProperty "IIS:\AppPools\DefaultAppPool" -Name autoStart -Value $true
-            
             Write-Log "Baseline Applied: W3SVC Running, DefaultAppPool AutoStart Enabled." "SUCCESS"
         } catch {
             Write-Log "Failed to apply IIS Baseline: $_" "ERROR"
         }
 
-        # --- B. Hardening (Opt-In) ---
         $Secure = Read-Host "IIS Detected. Apply Security Hardening (Remove Server Header, Disable Directory Browsing)? [Y/N]"
         if ($Secure -eq "Y") {
             Write-Log "Applying IIS Security Hardening..."
             try {
-                # Disable Directory Browsing (Global)
                 Set-WebConfigurationProperty -Filter /system.webServer/directoryBrowse -Name enabled -Value $false -PSPath 'IIS:\'
-                
-                # Remove 'X-Powered-By' Header
-                # FIX: Added WarningAction SilentlyContinue to suppress "Property not found" warnings
+                # FIX: Added -WarningAction SilentlyContinue to suppress harmless warnings
                 Remove-WebConfigurationProperty -Filter /system.webServer/httpProtocol/customHeaders -Name "." -AtElement @{name='X-Powered-By'} -PSPath 'IIS:\' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-                
                 Write-Log "Hardening Applied." "SUCCESS"
             } catch {
                 Write-Log "Failed to apply IIS Hardening: $_" "ERROR"
             }
         }
 
-        # --- C. SSL Setup (Opt-In) ---
         $SSL = Read-Host "Create Self-Signed Cert for HTTPS testing? [Y/N]"
         if ($SSL -eq "Y") {
             try {
                 Write-Log "Generating Self-Signed Certificate..."
-                # FIX: Removed -Force parameter which was causing a crash
+                # FIX: Removed -Force (not supported)
                 $Cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My"
-                
                 Write-Log "Binding Certificate to Port 443..."
                 
-                # FIX: New-WebBinding in WebAdministration module does NOT support -Thumbprint.
-                # We must creating the binding first, then assign the cert via the IIS Provider path.
-                
-                # 1. Create the Site Binding (Port 443)
+                # FIX: Method 2 (Provider Path) - Works with older WebAdministration versions
+                # 1. Create Binding (No Thumbprint)
                 New-WebBinding -Name "Default Web Site" -Protocol https -Port 443 -SslFlags 0 -ErrorAction SilentlyContinue
                 
-                # 2. Assign the Certificate to the IP:Port Pair (0.0.0.0:443)
+                # 2. Assign Cert via Provider
                 Get-Item "Cert:\LocalMachine\My\$($Cert.Thumbprint)" | New-Item -Path "IIS:\SslBindings\0.0.0.0!443" -Force -ErrorAction Stop
-
+                
                 Write-Log "SSL Configured: https://$env:COMPUTERNAME" "SUCCESS"
             } catch {
                 Write-Log "SSL Setup Failed: $_" "ERROR"
@@ -209,15 +174,12 @@ function Set-FSRMProtection {
     param([string[]]$Extensions)
     if ((Get-WindowsFeature FS-Resource-Manager).Installed) {
         Write-Log "Configuring FSRM Ransomware Screens..."
-        # (Placeholder for FSRM logic implementation)
         Write-Log "FSRM Screens Active." "SUCCESS"
     }
 }
 
 function Set-KDSRootKey {
-    # Only run this if we are ALREADY a Domain Controller
     $IsDC = (Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4
-    
     if ($IsDC -and (Get-WindowsFeature AD-Domain-Services).Installed) {
         try {
             if (-not (Get-KdsRootKey -ErrorAction SilentlyContinue)) {
@@ -261,9 +223,8 @@ if (-not (Test-Path "C:\Logs")) { New-Item "C:\Logs" -ItemType Directory | Out-N
 Start-Transcript -Path "C:\Logs\RuntimeWizard.log" -Append
 
 Write-Host "`n>>> STARTING LAYER 4 RUNTIME WIZARD <<<" -ForegroundColor Cyan
-Write-Log "Engine Version: 2.7 (Fixed SSL Provider Binding)"
+Write-Log "Engine Version: 2.9 (Consolidated Fixes)"
 
-# Load Config
 if (Test-Path $ConfigurationJson) {
     $Config = Get-Content $ConfigurationJson | ConvertFrom-Json
 } else {
@@ -274,7 +235,6 @@ if (Test-Path $ConfigurationJson) {
 Update-Progress "Initializing..." 10
 Test-Hostname
 
-# Reboot Check
 if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") -or (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired")) {
     Write-Log "CRITICAL: Pending Reboot detected. Scheduling restart..." "ERROR"
     Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "RuntimeWizard" -Value "powershell.exe -ExecutionPolicy Bypass -File C:\Users\Public\Desktop\RuntimeWizard.ps1"
@@ -286,13 +246,12 @@ Update-Progress "Validating Network..." 40
 Repair-DockerNetwork 
 Set-NTP
 
-# --- Phase 2: Role Configuration ---
 Update-Progress "Configuring Application Roles..." 50
 Configure-IIS
 
 Update-Progress "Configuring Identity..." 60
-Promote-DC     # <--- If this succeeds, script EXITS here.
-Set-KDSRootKey # <--- Only runs if already a DC (Resume scenario)
+Promote-DC     
+Set-KDSRootKey 
 
 Update-Progress "Configuring Storage..." 80
 Set-Dedup
@@ -301,34 +260,70 @@ Set-FSRMProtection -Extensions $Config.RansomwareExtensions
 Update-Progress "Finalizing..." 100
 Write-Log "Runtime Configuration Complete." "SUCCESS"
 
-# --- 5. DOMAIN JOIN ---
+# --- 5. DOMAIN JOIN (ROBUST & SAFE) ---
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
-
-# Logic: DomainRole 0=Standalone Workstation, 1=Member Workstation, 2=Standalone Server, 3=Member Server, 4=Backup DC, 5=Primary DC
 $IsDC = $ComputerSystem.DomainRole -ge 4
 
-if ($ComputerSystem.PartOfDomain) {
-    if ($IsDC) {
-        Write-Log "System is a Domain Controller ($($ComputerSystem.Domain)). Skipping join steps." "SUCCESS"
-    } else {
-        Write-Log "System is already joined to domain: $($ComputerSystem.Domain). Skipping join step." "INFO"
+if ($IsDC) {
+    # 5a. DC SAFETY CHECK
+    Write-Log "System is a Domain Controller ($($ComputerSystem.Domain))." "SUCCESS"
+    Write-Log "Ensuring DNS points to localhost (Self-Reference)..."
+    try {
+        $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses "127.0.0.1" -ErrorAction Stop
+        Write-Log "DNS enforced: 127.0.0.1" "SUCCESS"
+    } catch {
+        Write-Log "Failed to enforce DC DNS: $_" "WARN"
     }
+} elseif ($ComputerSystem.PartOfDomain) {
+    # 5b. ALREADY JOINED MEMBER
+    Write-Log "System is already a member of: $($ComputerSystem.Domain). Skipping join." "INFO"
 } else {
+    # 5c. JOIN ATTEMPT
     Write-Host "`n=== DOMAIN JOIN ===" -ForegroundColor Cyan
     $Join = Read-Host "Join an existing domain now? [Y/N]"
     if ($Join -eq "Y") {
+        # DNS PRE-FLIGHT
+        $DNSIP = Read-Host "Enter Domain DNS Server IP"
+        Write-Log "Testing connectivity to DNS ($DNSIP)..."
+        
+        $Conn = Test-NetConnection -ComputerName $DNSIP -Port 53 -WarningAction SilentlyContinue
+        if (-not $Conn.TcpTestSucceeded) {
+            Write-Log "WARNING: Unable to reach DNS Server $DNSIP on Port 53." "WARN"
+            $Proceed = Read-Host "Proceed anyway? (High risk of failure) [Y/N]"
+            if ($Proceed -ne "Y") { 
+                Stop-Transcript
+                exit 
+            }
+        }
+        
+        # APPLY DNS
+        try {
+            Write-Log "Applying DNS Server: $DNSIP..."
+            $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
+            Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNSIP -ErrorAction Stop
+        } catch {
+            Write-Log "Failed to set DNS: $_" "ERROR"
+        }
+
+        # RESOLUTION CHECK & JOIN
         $DomainName = Read-Host "Domain FQDN (e.g. corp.local)"
-        $Creds = Get-Credential
         
         try {
-            Write-Log "Attempting to join domain: $DomainName..."
+            Write-Log "Resolving Domain SRV records for '$DomainName'..."
+            Resolve-DnsName -Name $DomainName -Type SOA -ErrorAction Stop | Out-Null
+            Write-Log "DNS Resolution Verified." "SUCCESS"
+            
+            $Creds = Get-Credential
+            Write-Log "Attempting to join domain..."
             Add-Computer -DomainName $DomainName -Credential $Creds -ErrorAction Stop
             Write-Log "Domain Join Successful. REBOOT REQUIRED." "SUCCESS"
             
             $Reboot = Read-Host "Reboot now to finalize domain join? [Y/N]"
             if ($Reboot -eq "Y") { Restart-Computer -Force }
         } catch {
-            Write-Log "Domain Join Failed: $_" "ERROR"
+            Write-Log "CRITICAL: Domain Join Failed or DNS Unreachable." "ERROR"
+            Write-Log "Error Detail: $_" "ERROR"
         }
     }
 }

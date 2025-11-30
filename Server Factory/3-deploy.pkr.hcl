@@ -11,6 +11,11 @@ variable "role" { type = string }
 variable "vm_name" { type = string }
 variable "vm_ram" { type = number }
 variable "vm_cpu" { type = number }
+# FIX: Added switch_name variable to accept input from build.ps1
+variable "switch_name" { 
+  type    = string 
+  default = "Default Switch" 
+}
 
 source "hyperv-vmcx" "deploy" {
   # --- DYNAMIC PATHS ---
@@ -20,7 +25,8 @@ source "hyperv-vmcx" "deploy" {
   vm_name          = "${var.vm_name}"
   cpus             = var.vm_cpu
   memory           = var.vm_ram
-  switch_name      = "Default Switch"
+  # FIX: Use the variable instead of hardcoded string
+  switch_name      = var.switch_name
   headless         = false
   
   communicator   = "winrm"
@@ -43,7 +49,6 @@ build {
     script = "scripts/deploy-config.ps1"
   }
   
-  # FIX: HCL arguments must be on separate lines. Semicolons are not allowed.
   provisioner "file" { 
     source      = "scripts/RuntimeWizard.ps1" 
     destination = "C:\\Users\\Public\\Desktop\\RuntimeWizard.ps1" 
