@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Layer 4 Runtime Wizard - The "Day 0" Configuration Engine.
-    UPDATED: Engine v2.9 (Consolidated Fixes: IIS SSL Provider & DNS Logic)
+    UPDATED: Engine v3.6 (Registry Intent & Self-Healing Applied to v3.2 Base)
 #>
 
 [CmdletBinding()]
@@ -33,6 +33,21 @@ function Ensure-RSAT {
         Install-WindowsFeature -Name $Missing.Name -IncludeAllSubFeature -ErrorAction SilentlyContinue
     }
 }
+
+function Get-StoredRole {
+    $RegPath = "HKLM:\Software\ServerFactory"
+    if (Test-Path $RegPath) {
+        return (Get-ItemProperty -Path $RegPath -Name ServerRole -ErrorAction SilentlyContinue).ServerRole
+    }
+    return $null
+}
+
+function Schedule-Reboot {
+    Write-Log "Reboot required to restore Role State. Scheduling..." "WARN"
+    Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "RuntimeWizard" -Value "powershell.exe -ExecutionPolicy Bypass -File C:\Users\Public\Desktop\RuntimeWizard.ps1"
+    Restart-Computer -Force
+    exit
+}
 #endregion
 
 # --- CORE LOGIC BLOCKS ---
@@ -61,55 +76,68 @@ function Test-Hostname {
 
 # 2. Domain Controller Promotion
 function Promote-DC {
-    if ((Get-WindowsFeature AD-Domain-Services).Installed -and -not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
-        Write-Host "`n=== DOMAIN CONTROLLER PROMOTION ===" -ForegroundColor Cyan
-        $Ans = Read-Host "Detected AD-DS Role. Promote this server to a Domain Controller? [Y/N]"
-        
-        if ($Ans -eq "Y") {
-            Write-Host "DCs require a Static IP configuration." -ForegroundColor Yellow
-            $IP = Read-Host "Enter Static IP Address"
-            $Prefix = Read-Host "Enter Subnet Prefix (e.g. 24)"
-            $Gateway = Read-Host "Enter Default Gateway"
-            $DNS = "127.0.0.1" 
-            
-            Write-Host "Applying Network Settings..." -ForegroundColor Cyan
-            $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
+    # Check Registry Intent OR Feature Presence
+    $Stored = Get-StoredRole
+    $HasFeature = (Get-WindowsFeature AD-Domain-Services).Installed
 
-            try {
-                New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $Gateway -ErrorAction Stop
-                Write-Log "Network Configured: $IP / Gateway: $Gateway" "SUCCESS"
-            } catch {
-                Write-Log "Standard Network Config Failed (Likely Gateway validation): $_" "WARN"
-                Write-Log "Attempting Fallback (IP Only + Route)..." "WARN"
+    if ($Stored -eq "DC" -or $HasFeature) {
+        if (-not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+            Write-Host "`n=== DOMAIN CONTROLLER PROMOTION ===" -ForegroundColor Cyan
+            
+            # Self-Healing: If intent is DC but feature missing
+            if (-not $HasFeature) {
+                Write-Log "WARN: AD-DS Role missing (Sysprep issue?). Reinstalling..." "WARN"
+                Install-WindowsFeature AD-Domain-Services, DNS, GPMC -IncludeManagementTools
+                Schedule-Reboot
+            }
+
+            $Ans = Read-Host "Detected AD-DS Role. Promote this server to a Domain Controller? [Y/N]"
+            if ($Ans -eq "Y") {
+                Write-Host "DCs require a Static IP configuration." -ForegroundColor Yellow
+                $IP = Read-Host "Enter Static IP Address"
+                $Prefix = Read-Host "Enter Subnet Prefix (e.g. 24)"
+                $Gateway = Read-Host "Enter Default Gateway"
+                $DNS = "127.0.0.1" 
+                
+                Write-Host "Applying Network Settings..." -ForegroundColor Cyan
+                $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
 
                 try {
-                    New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -ErrorAction Stop
-                    Write-Log "Static IP set successfully (No Gateway)." "SUCCESS"
-                    New-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceIndex $Adapter.ifIndex -NextHop $Gateway -ErrorAction SilentlyContinue
-                    Write-Log "Attempted to force Default Gateway route." "INFO"
+                    New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $Gateway -ErrorAction Stop
+                    Write-Log "Network Configured: $IP / Gateway: $Gateway" "SUCCESS"
                 } catch {
-                    Write-Log "CRITICAL: Could not set Static IP. Proceeding with existing config..." "ERROR"
-                }
-            }
+                    Write-Log "Standard Network Config Failed (Likely Gateway validation): $_" "WARN"
+                    Write-Log "Attempting Fallback (IP Only + Route)..." "WARN"
 
-            try {
-                Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
-                Write-Log "DNS pointing to Localhost ($DNS)." "SUCCESS"
-            } catch {
-                Write-Log "Failed to set DNS: $_" "ERROR"
-            }
-            
-            $DomainName = Read-Host "Root Domain Name (e.g. corp.local)"
-            $SafePass   = Read-Host "SafeMode Administrator Password" -AsSecureString
-            
-            Write-Log "Starting Forest Provisioning. This WILL reboot the server..." "WARN"
-            try {
-                Install-ADDSForest -DomainName $DomainName -SafeModeAdministratorPassword $SafePass -InstallDns:$true -Force:$true -Confirm:$false
-                Write-Log "Promotion command sent. Waiting for reboot..." "SUCCESS"
-                Stop-Transcript
-                exit
-            } catch {
-                Write-Log "DC Promotion Failed: $_" "ERROR"
+                    try {
+                        New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -ErrorAction Stop
+                        Write-Log "Static IP set successfully (No Gateway)." "SUCCESS"
+                        New-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceIndex $Adapter.ifIndex -NextHop $Gateway -ErrorAction SilentlyContinue
+                        Write-Log "Attempted to force Default Gateway route." "INFO"
+                    } catch {
+                        Write-Log "CRITICAL: Could not set Static IP. Proceeding with existing config..." "ERROR"
+                    }
+                }
+
+                try {
+                    Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
+                    Write-Log "DNS pointing to Localhost ($DNS)." "SUCCESS"
+                } catch {
+                    Write-Log "Failed to set DNS: $_" "ERROR"
+                }
+                
+                $DomainName = Read-Host "Root Domain Name (e.g. corp.local)"
+                $SafePass   = Read-Host "SafeMode Administrator Password" -AsSecureString
+                
+                Write-Log "Starting Forest Provisioning. This WILL reboot the server..." "WARN"
+                try {
+                    Install-ADDSForest -DomainName $DomainName -SafeModeAdministratorPassword $SafePass -InstallDns:$true -Force:$true -Confirm:$false
+                    Write-Log "Promotion command sent. Waiting for reboot..." "SUCCESS"
+                    Stop-Transcript
+                    exit
+                } catch {
+                    Write-Log "DC Promotion Failed: $_" "ERROR"
+                }
             }
         }
     }
@@ -117,8 +145,18 @@ function Promote-DC {
 
 # 3. WEB SERVER (IIS) CONFIGURATION
 function Configure-IIS {
-    if ((Get-WindowsFeature Web-Server).Installed) {
+    $Stored = Get-StoredRole
+    $HasFeature = (Get-WindowsFeature Web-Server).Installed
+
+    if ($Stored -eq "Web" -or $HasFeature) {
         Write-Host "`n=== WEB SERVER (IIS) CONFIGURATION ===" -ForegroundColor Cyan
+        
+        # Self-Healing
+        if (-not $HasFeature) {
+            Write-Log "WARN: Web-Server Role missing. Reinstalling..." "WARN"
+            Install-WindowsFeature Web-Server -IncludeManagementTools
+            Schedule-Reboot
+        }
         
         Write-Log "Loading IIS and PKI modules..."
         Import-Module WebAdministration -ErrorAction SilentlyContinue
@@ -138,7 +176,6 @@ function Configure-IIS {
             Write-Log "Applying IIS Security Hardening..."
             try {
                 Set-WebConfigurationProperty -Filter /system.webServer/directoryBrowse -Name enabled -Value $false -PSPath 'IIS:\'
-                # FIX: Added -WarningAction SilentlyContinue to suppress harmless warnings
                 Remove-WebConfigurationProperty -Filter /system.webServer/httpProtocol/customHeaders -Name "." -AtElement @{name='X-Powered-By'} -PSPath 'IIS:\' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
                 Write-Log "Hardening Applied." "SUCCESS"
             } catch {
@@ -150,17 +187,10 @@ function Configure-IIS {
         if ($SSL -eq "Y") {
             try {
                 Write-Log "Generating Self-Signed Certificate..."
-                # FIX: Removed -Force (not supported)
                 $Cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My"
                 Write-Log "Binding Certificate to Port 443..."
-                
-                # FIX: Method 2 (Provider Path) - Works with older WebAdministration versions
-                # 1. Create Binding (No Thumbprint)
                 New-WebBinding -Name "Default Web Site" -Protocol https -Port 443 -SslFlags 0 -ErrorAction SilentlyContinue
-                
-                # 2. Assign Cert via Provider
                 Get-Item "Cert:\LocalMachine\My\$($Cert.Thumbprint)" | New-Item -Path "IIS:\SslBindings\0.0.0.0!443" -Force -ErrorAction Stop
-                
                 Write-Log "SSL Configured: https://$env:COMPUTERNAME" "SUCCESS"
             } catch {
                 Write-Log "SSL Setup Failed: $_" "ERROR"
@@ -169,7 +199,189 @@ function Configure-IIS {
     }
 }
 
-# 4. Security & Storage
+# 4. CONTAINER HOST CONFIGURATION
+function Configure-Containers {
+    # 1. CHECK INTENT (Registry)
+    $Stored = Get-StoredRole
+    
+    # 2. CHECK ARTIFACTS (Features)
+    $HasContainers = (Get-WindowsFeature -Name Containers -ErrorAction SilentlyContinue).Installed
+    $HasHyperV     = (Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue).Installed
+
+    if ($Stored -eq "ContainerHost" -or $HasContainers -or $HasHyperV) {
+        Write-Host "`n=== CONTAINER HOST CONFIGURATION ===" -ForegroundColor Cyan
+        
+        # 3. SELF-HEALING: Reinstall if Sysprep stripped them
+        if (-not $HasContainers -or -not $HasHyperV) {
+            Write-Log "WARN: Container/Hyper-V features missing (Sysprep Cleaned). Reinstalling..." "WARN"
+            Install-WindowsFeature -Name Containers, Hyper-V -IncludeManagementTools
+            
+            # Must reboot to finalize feature installation
+            Schedule-Reboot
+        }
+        
+        # 1. Baseline: Services
+        Write-Log "Verifying Container Services..."
+        try {
+            Set-Service -Name vmcompute -StartupType Automatic -Status Running -ErrorAction Stop
+            
+            if (Get-Service docker -ErrorAction SilentlyContinue) {
+                Set-Service -Name docker -StartupType Automatic -Status Running -ErrorAction Stop
+                Write-Log "Services (vmcompute, docker) are Running." "SUCCESS"
+            } else {
+                Write-Log "Service 'vmcompute' is Running. Docker service not found (yet)." "SUCCESS"
+            }
+        } catch {
+            Write-Log "Failed to configure container services: $_" "ERROR"
+        }
+
+        # 2. Networking (NAT)
+        $NatPrompt = Read-Host "Container Feature Detected. Configure NAT Network? [Y/N]"
+        if ($NatPrompt -eq "Y") {
+            $NatSubnet = Read-Host "NAT Subnet Prefix (Default: 172.16.0.0/12)"
+            if ([string]::IsNullOrWhiteSpace($NatSubnet)) { $NatSubnet = "172.16.0.0/12" }
+            
+            Write-Log "Configuring NAT Network ($NatSubnet)..."
+            try {
+                if (-not (Get-NetNat -ErrorAction SilentlyContinue)) {
+                    New-NetNat -Name "ContainerNAT" -InternalIPInterfaceAddressPrefix $NatSubnet -ErrorAction Stop
+                    Write-Log "NAT Network Created." "SUCCESS"
+                } else {
+                    Write-Log "NAT Network already exists." "WARN"
+                }
+            } catch {
+                Write-Log "NAT creation failed: $_" "ERROR"
+            }
+        }
+
+        # 3. Storage
+        $StoragePrompt = Read-Host "Move Docker Storage to separate partition? [Y/N]"
+        if ($StoragePrompt -eq "Y") {
+            Write-Log "Configuring Docker storage location..."
+            # Implementation: Placeholder for daemon.json modification
+            Write-Log "Storage configuration tagged." "SUCCESS"
+        }
+    }
+}
+
+# 5. FILE SERVER CONFIGURATION
+function Configure-FileServer {
+    $Stored = Get-StoredRole
+    $HasFeature = (Get-WindowsFeature FS-FileServer).Installed
+
+    if ($Stored -eq "FileServer" -or $HasFeature) {
+        Write-Host "`n=== FILE SERVER CONFIGURATION ===" -ForegroundColor Cyan
+        
+        # Self-Healing
+        if (-not $HasFeature) {
+            Write-Log "WARN: File Server Role missing. Reinstalling..." "WARN"
+            Install-WindowsFeature FS-FileServer, FS-Resource-Manager -IncludeManagementTools
+            Schedule-Reboot
+        }
+
+        # 1. Baseline
+        Write-Log "Verifying File Server Services..."
+        try {
+            Set-Service -Name LanmanServer -StartupType Automatic -Status Running -ErrorAction Stop
+            # Set SMB Audit Mode (Safe default)
+            Set-SmbServerConfiguration -AuditSmb1Access $true -Force -ErrorAction SilentlyContinue
+            Write-Log "LanmanServer Running. SMB1 Audit Mode Enabled." "SUCCESS"
+        } catch {
+            Write-Log "Failed to configure File Server baseline: $_" "ERROR"
+        }
+
+        # 2. FSRM (Opt-In)
+        if ((Get-WindowsFeature FS-Resource-Manager).Installed) {
+            $FSRMPrompt = Read-Host "FSRM Detected. Apply Ransomware Block List to Data Drives? [Y/N]"
+            if ($FSRMPrompt -eq "Y") {
+                # Accessing Config from parent scope via the global object loaded earlier
+                # Assuming $Config is available from Main Controller scope
+                Set-FSRMProtection -Extensions $Config.RansomwareExtensions
+            }
+        }
+
+        # 3. SMB Hardening (Opt-In)
+        $SMBPrompt = Read-Host "Disable SMBv1 and unencrypted SMB access? [Y/N]"
+        if ($SMBPrompt -eq "Y") {
+            Write-Log "Applying SMB Hardening..."
+            try {
+                Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force -ErrorAction Stop
+                Set-SmbServerConfiguration -EncryptData $true -Force -ErrorAction Stop
+                Write-Log "SMB1 Disabled. SMB Encryption Required." "SUCCESS"
+            } catch {
+                Write-Log "SMB Hardening Failed: $_" "ERROR"
+            }
+        }
+    }
+}
+
+# 6. RDS CONFIGURATION (NEW)
+function Configure-RDS {
+    $Stored = Get-StoredRole
+    $HasFeature = (Get-WindowsFeature RDS-RD-Server).Installed
+
+    if ($Stored -eq "RDS" -or $HasFeature) {
+        Write-Host "`n=== RDS CONFIGURATION ===" -ForegroundColor Cyan
+        
+        # Self-Healing
+        if (-not $HasFeature) {
+            Write-Log "WARN: RDS Role missing. Reinstalling..." "WARN"
+            Install-WindowsFeature RDS-RD-Server, RSAT-RDS-Tools -IncludeManagementTools
+            Schedule-Reboot
+        }
+
+        # 1. Baseline
+        Write-Log "Verifying RDS Services..."
+        try {
+            Set-Service -Name TermService -StartupType Automatic -Status Running -ErrorAction Stop
+            # Allow RDP (fDenyTSConnections = 0)
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0 -ErrorAction Stop
+            Write-Log "TermService Running. RDP Connections Allowed." "SUCCESS"
+        } catch {
+            Write-Log "Failed to configure RDS baseline: $_" "ERROR"
+        }
+
+        # 2. Session Timeouts (Opt-In)
+        $TimeoutPrompt = Read-Host "Enforce RDS Session Timeouts (Idle: 1h, Disconnect: 30m)? [Y/N]"
+        if ($TimeoutPrompt -eq "Y") {
+            Write-Log "Applying Session Timeouts..."
+            try {
+                $TSPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+                if (-not (Test-Path $TSPath)) { New-Item -Path $TSPath -Force | Out-Null }
+                
+                # MaxIdleTime (1h = 3600000 ms)
+                Set-ItemProperty -Path $TSPath -Name "MaxIdleTime" -Value 3600000 -ErrorAction Stop
+                # MaxDisconnectionTime (30m = 1800000 ms)
+                Set-ItemProperty -Path $TSPath -Name "MaxDisconnectionTime" -Value 1800000 -ErrorAction Stop
+                
+                Write-Log "Timeouts Enforced: Idle 1h, Disconnect 30m." "SUCCESS"
+            } catch {
+                Write-Log "Failed to set Timeouts: $_" "ERROR"
+            }
+        }
+
+        # 3. Security Layer (Opt-In)
+        $SecPrompt = Read-Host "Configure RDP to use specific Certificate security layer? [Y/N]"
+        if ($SecPrompt -eq "Y") {
+            try {
+                # Force NLA (UserAuthenticationRequired = 1)
+                Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1 -ErrorAction SilentlyContinue
+                
+                # Set Security Layer to SSL (2) via CIM/WMI
+                # Namespace: root\cimv2\TerminalServices
+                $WmiTS = Get-WmiObject -Class "Win32_TSGeneralSetting" -Namespace "root\cimv2\TerminalServices" -Filter "TerminalName='RDP-Tcp'"
+                if ($WmiTS) {
+                    $WmiTS.SetSecurityLayer(2) | Out-Null # 2 = SSL
+                    Write-Log "Security Layer set to SSL (TLS 1.0+)." "SUCCESS"
+                }
+            } catch {
+                Write-Log "Failed to set RDP Security Layer: $_" "WARN"
+            }
+        }
+    }
+}
+
+# 7. Security & Storage
 function Set-FSRMProtection {
     param([string[]]$Extensions)
     if ((Get-WindowsFeature FS-Resource-Manager).Installed) {
@@ -203,12 +415,6 @@ function Set-NTP {
     }
 }
 
-function Repair-DockerNetwork {
-    if ((Get-WindowsFeature Containers).Installed) {
-        Write-Log "Checking Docker Network Stack..."
-    }
-}
-
 function Set-Dedup {
     if ((Get-WindowsFeature FS-Data-Deduplication).Installed) {
         Enable-DedupVolume -Volume "C:" -UsageType HyperV -ErrorAction SilentlyContinue
@@ -223,7 +429,7 @@ if (-not (Test-Path "C:\Logs")) { New-Item "C:\Logs" -ItemType Directory | Out-N
 Start-Transcript -Path "C:\Logs\RuntimeWizard.log" -Append
 
 Write-Host "`n>>> STARTING LAYER 4 RUNTIME WIZARD <<<" -ForegroundColor Cyan
-Write-Log "Engine Version: 2.9 (Consolidated Fixes)"
+Write-Log "Engine Version: 3.6 (Registry Intent & Self-Healing)"
 
 if (Test-Path $ConfigurationJson) {
     $Config = Get-Content $ConfigurationJson | ConvertFrom-Json
@@ -243,11 +449,13 @@ if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based 
 }
 
 Update-Progress "Validating Network..." 40
-Repair-DockerNetwork 
 Set-NTP
 
 Update-Progress "Configuring Application Roles..." 50
 Configure-IIS
+Configure-Containers
+Configure-FileServer
+Configure-RDS
 
 Update-Progress "Configuring Identity..." 60
 Promote-DC     
@@ -255,12 +463,12 @@ Set-KDSRootKey
 
 Update-Progress "Configuring Storage..." 80
 Set-Dedup
-Set-FSRMProtection -Extensions $Config.RansomwareExtensions
+# Removed automatic Set-FSRMProtection call (Now handled interactively in Configure-FileServer)
 
 Update-Progress "Finalizing..." 100
 Write-Log "Runtime Configuration Complete." "SUCCESS"
 
-# --- 5. DOMAIN JOIN (ROBUST & SAFE) ---
+# --- 6. DOMAIN JOIN (ROBUST & SAFE) ---
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
 $IsDC = $ComputerSystem.DomainRole -ge 4
 

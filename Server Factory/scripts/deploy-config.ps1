@@ -6,12 +6,18 @@ $VMName = $env:VM_NAME
 
 Write-Host "--- APPLYING ROLE: $Role ---"
 
-# --- NAME SEEDING (CRITICAL: Must survive Sysprep) ---
+# --- NAME & ROLE SEEDING (CRITICAL: Must survive Sysprep) ---
 # We use the Registry for persistence, as the file system (C:\ProgramData) is wiped by Sysprep.
 $FactoryRegPath = "HKLM:\Software\ServerFactory"
 if (-not (Test-Path $FactoryRegPath)) { New-Item -Path $FactoryRegPath -ItemType Directory -Force | Out-Null }
+
+# SEED HOSTNAME
 Set-ItemProperty -Path $FactoryRegPath -Name TargetName -Value $VMName
-Write-Host "Hostname '$VMName' seeded for Layer 4 in registry."
+
+# SEED ROLE (NEW FIX: Ensures Layer 4 knows the role even if Sysprep strips features)
+Set-ItemProperty -Path $FactoryRegPath -Name ServerRole -Value $Role
+
+Write-Host "Identity '$VMName' and Role '$Role' seeded to Registry."
 
 # --- INSTALL BINARIES (Layer 3's core function) ---
 switch ($Role) {
