@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Layer 4 Runtime Wizard - The "Day 0" Configuration Engine.
-    UPDATED: Engine v3.6 (Registry Intent & Self-Healing Applied to v3.2 Base)
+    UPDATED: Engine v3.7 (Fixes Reboot Loop on Unsupported Hardware)
 #>
 
 [CmdletBinding()]
@@ -213,11 +213,30 @@ function Configure-Containers {
         
         # 3. SELF-HEALING: Reinstall if Sysprep stripped them
         if (-not $HasContainers -or -not $HasHyperV) {
-            Write-Log "WARN: Container/Hyper-V features missing (Sysprep Cleaned). Reinstalling..." "WARN"
-            Install-WindowsFeature -Name Containers, Hyper-V -IncludeManagementTools
+            Write-Log "WARN: Container/Hyper-V features missing (Sysprep Cleaned). Attempting Reinstall..." "WARN"
             
-            # Must reboot to finalize feature installation
-            Schedule-Reboot
+            try {
+                # Attempt to install. Use ErrorAction Stop to catch the prerequisite failures.
+                Install-WindowsFeature -Name Containers, Hyper-V -IncludeManagementTools -ErrorAction Stop
+                
+                # If successful, we MUST reboot.
+                Schedule-Reboot
+            }
+            catch {
+                # --- HARDWARE VALIDATION LOGIC ---
+                $Err = $_.Exception.Message
+                
+                if ($Err -match "virtualization capabilities" -or $Err -match "Hyper-V cannot be installed") {
+                    Write-Log "CRITICAL: Hardware Validation Failed. This CPU does not support Nested Virtualization/Hyper-V." "ERROR"
+                    Write-Log "Container Host Role cannot be fully activated on this hardware." "ERROR"
+                    Write-Log "SKIPPING Container Configuration to prevent reboot loop." "WARN"
+                    return # EXIT FUNCTION IMMEDIATELY - Do NOT Reboot
+                } else {
+                    Write-Log "Feature Installation Failed (Unknown Reason): $Err" "ERROR"
+                    Write-Log "Skipping to prevent loop." "WARN"
+                    return # EXIT FUNCTION
+                }
+            }
         }
         
         # 1. Baseline: Services
@@ -315,7 +334,7 @@ function Configure-FileServer {
     }
 }
 
-# 6. RDS CONFIGURATION (NEW)
+# 6. RDS CONFIGURATION
 function Configure-RDS {
     $Stored = Get-StoredRole
     $HasFeature = (Get-WindowsFeature RDS-RD-Server).Installed
@@ -429,7 +448,7 @@ if (-not (Test-Path "C:\Logs")) { New-Item "C:\Logs" -ItemType Directory | Out-N
 Start-Transcript -Path "C:\Logs\RuntimeWizard.log" -Append
 
 Write-Host "`n>>> STARTING LAYER 4 RUNTIME WIZARD <<<" -ForegroundColor Cyan
-Write-Log "Engine Version: 3.6 (Registry Intent & Self-Healing)"
+Write-Log "Engine Version: 3.7 (Fixed Reboot Loop on Unsupported HW)"
 
 if (Test-Path $ConfigurationJson) {
     $Config = Get-Content $ConfigurationJson | ConvertFrom-Json
