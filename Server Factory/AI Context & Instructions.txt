@@ -16,7 +16,7 @@ Input: Raw ISO (ISO/WS2022.iso).
 
 Output: Raw VHDX with OS installed.
 
-Tool: Packer hyperv-iso.
+Tool: Packer hyperv-iso (Self-contained template).
 
 Key File: 1-base.pkr.hcl.
 
@@ -54,7 +54,17 @@ Tool: PowerShell Script (RuntimeWizard.ps1).
 
 Critical Engineering Constraints (DO NOT BREAK)
 
-A. Hostname & Role Persistence (The "Registry Intent" Pattern)
+A. Master Build Wrapper (build.ps1)
+
+The scripts/build.ps1 script is the SINGLE entry point.
+
+It handles PATH management (injecting tools\Oscdimg for Layer 1).
+
+It provides a menu to select Layer 1, 2, or 3.
+
+It dynamically scans Hyper-V switches for Layer 3.
+
+B. Hostname & Role Persistence (The "Registry Intent" Pattern)
 
 Problem: Sysprep /generalize wipes C:\ProgramData and often strips feature flags (specifically Containers/Hyper-V status).
 
@@ -64,47 +74,37 @@ Path: HKLM:\Software\ServerFactory
 
 Keys: 'TargetName' and 'ServerRole'.
 
-Layer 4 Logic: Always check Get-StoredRole (Registry) first. If the Registry says "ContainerHost" but the feature is missing, trigger Self-Healing (reinstall + reboot).
+Layer 4 Logic: Always check Get-StoredRole (Registry) first.
 
-B. The "Opt-In" Hardening Rule
+Self-Healing: If Registry says "ContainerHost" but feature is missing, reinstall + reboot.
+
+Hardware Validation: If hardware doesn't support Nested Virtualization, fail gracefully (do not reboot loop).
+
+C. The "Opt-In" Hardening Rule
 
 Constraint: The Runtime Wizard must NEVER automatically apply breaking changes (Firewalls, Disabling Protocols, AppLocker).
 
 Pattern: Detect the Role -> PROMPT the User -> Apply only if [Y].
 
-Example: "IIS Detected. Apply Security Hardening? [Y/N]".
+D. Packer Template Independence
 
-C. DC Promotion Logic (Fragile)
+Each .pkr.hcl file (1-base, 2-patch, 3-deploy) is self-contained.
 
-Constraint: Promoting a DC requires a reboot and specific DNS settings.
+They each contain their own required_plugins block.
 
-Logic:
-
-Set IP/DNS (Pre-Flight).
-
-Install-ADDSForest (No Start-Process wrapper).
-
-Allow the command to reboot the server naturally.
-
-Self-Reference: DCs must enforce DNS = 127.0.0.1.
-
-D. Dynamic Networking
-
-Layer 3: build.ps1 dynamically scans for Hyper-V switches and passes the selection to Packer.
-
-Layer 4: RuntimeWizard.ps1 performs DNS Pre-Flight checks before Domain Joining to prevent timeout errors.
+Do NOT run packer init . (root) as this causes duplicate plugin errors. Initialize/Build specific files or use the wrapper.
 
 Runtime Modules (Layer 4 Capabilities)
 
-The RuntimeWizard.ps1 engine is modular. It supports the following roles based on Registry Intent:
+The RuntimeWizard.ps1 engine is modular (Engine v3.7+).
 
-Web (IIS): Configures AppPools, Prompts for Hardening (Headers), Prompts for Self-Signed SSL.
+Web (IIS): Configures AppPools, Prompts for Hardening, Prompts for Self-Signed SSL.
 
-ContainerHost: Robust detection (Registry/Service/Feature). Prompts for NAT Network creation and Docker storage. Includes Self-Healing if Sysprep stripped the feature.
+ContainerHost: Checks Registry Intent. Validates CPU virtualization support. Prompts for NAT Network and Docker storage.
 
-FileServer: Prompts for FSRM Ransomware Screens (if FSRM installed) and SMB Hardening (Disable SMBv1).
+FileServer: Prompts for FSRM Ransomware Screens and SMB Hardening.
 
-RDS: Prompts for Session Timeouts (Idle/Disconnect) and Security Layer (NLA/SSL).
+RDS: Prompts for Session Timeouts and Security Layer.
 
 DC: Prompts for Forest Mode and Static IP.
 
@@ -112,17 +112,19 @@ Directory Structure Map
 
 / (Root)
 ├── packer.exe              # Local binary
-├── *.pkr.hcl               # Packer Templates (Layers 1-3)
-├── Autounattend.xml        # Boot config (WinRM enabled, Firewall enabled)
+├── 1-base.pkr.hcl          # Layer 1 Template (Base OS)
+├── 2-patch.pkr.hcl         # Layer 2 Template (Patching)
+├── 3-deploy.pkr.hcl        # Layer 3 Template (Deployment)
+├── Autounattend.xml        # Boot config
 ├── Unattend.xml            # Sysprep answer file
 │
 ├── scripts/
-│   ├── build.ps1           # MASTER WRAPPER: Handles inputs (CPU/RAM/Switch) and runs Packer.
-│   ├── update.ps1          # Robust update logic (3-Pass).
+│   ├── build.ps1           # MASTER WRAPPER: Handles Layer 1/2/3 selection & environment.
+│   ├── update.ps1          # Robust update logic.
 │   ├── deploy-config.ps1   # Layer 3: Installs Binaries & Seeds Registry.
 │   └── RuntimeWizard.ps1   # Layer 4: The Configuration Engine.
 │
-└── tools/Oscdimg/          # Dependency for creating ISOs
+└── tools/Oscdimg/          # Required for Layer 1 ISO creation
 
 Standard Operating Procedure
 
@@ -130,12 +132,22 @@ Open PowerShell as Administrator.
 
 Run .\scripts\build.ps1.
 
-Select Hardware: Choose vCPU (2,4,8,12) and RAM (2GB-16GB).
+Select Layer:
 
-Select Network: Script detects Hyper-V switches; choose the target.
+[1] Base Build (ISO -> VHDX)
 
-Select Role: (Web, DC, File, RDS, Container, Mgmt).
+[2] Patching (Update Cycle)
 
-Build: Wait for Packer to create the VM and import it.
+[3] Deployment (Create VM)
 
-Runtime: Connect to the VM console. The Wizard runs automatically. Follow the interactive prompts.
+If Layer 3 selected:
+
+Input Hostname, vCPU, RAM.
+
+Select Hyper-V Switch.
+
+Select Role.
+
+Wait for Packer completion.
+
+Connect to VM console for Runtime Wizard (Interactive).
