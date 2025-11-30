@@ -8,9 +8,8 @@ packer {
 }
 
 source "hyperv-vmcx" "patch" {
-  # --- DYNAMIC PATH FIX ---
-  # OLD: clone_from_vmcx_path = "C:\\Packer-Demo\\builds\\base"
-  # NEW: Uses ${path.root} to find the base image in the current project folder
+  # --- DYNAMIC PATHS ---
+  # Uses ${path.root} to find the base image in the current project folder
   clone_from_vmcx_path = "${path.root}/builds/base"
   
   vm_name          = "Server2022-Golden-Patched"
@@ -31,7 +30,7 @@ source "hyperv-vmcx" "patch" {
 build {
   sources = ["source.hyperv-vmcx.patch"]
 
-  # Pass 1
+  # Pass 1: Critical Updates
   provisioner "powershell" {
     script            = "scripts/update.ps1"
     elevated_user     = "Administrator"
@@ -39,16 +38,7 @@ build {
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # Pass 2
-  provisioner "powershell" {
-    pause_before      = "2m"
-    script            = "scripts/update.ps1"
-    elevated_user     = "Administrator"
-    elevated_password = "P@ssw0rd123!"
-  }
-  provisioner "windows-restart" { restart_timeout = "30m" }
-
-  # Pass 3
+  # Pass 2: Cumulative Updates
   provisioner "powershell" {
     pause_before      = "2m"
     script            = "scripts/update.ps1"
@@ -57,11 +47,31 @@ build {
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # Cleanup
+  # Pass 3: Final Sweep + CLEANUP
+  # FIX: Packer 'powershell' provisioner does not support 'arguments'. 
+  # We must upload the file first, then execute it with the switch inline.
+  
+  provisioner "file" {
+    source      = "scripts/update.ps1"
+    destination = "C:\\Windows\\Temp\\update.ps1"
+  }
+
+  provisioner "powershell" {
+    pause_before      = "2m"
+    inline            = ["& 'C:\\Windows\\Temp\\update.ps1' -Finalize"]
+    elevated_user     = "Administrator"
+    elevated_password = "P@ssw0rd123!"
+  }
+
+  provisioner "windows-restart" { restart_timeout = "30m" }
+
+  # Generic System Cleanup (Event Logs / Temp)
   provisioner "powershell" {
     inline = [
       "Remove-Item -Path $env:TEMP\\* -Recurse -Force -EA 0",
-      "Clear-EventLog -LogName Application, Security, System"
+      "Clear-EventLog -LogName Application, Security, System",
+      # Clean up the script we uploaded in Pass 3
+      "Remove-Item -Path 'C:\\Windows\\Temp\\update.ps1' -Force -ErrorAction SilentlyContinue"
     ]
   }
 }

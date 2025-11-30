@@ -1,26 +1,7 @@
 ﻿<#
 .SYNOPSIS
-    Layer 4 Runtime Wizard - The "Day 0" Configuration Engine for Windows Server.
-    
-.DESCRIPTION
-    This script finalizes the configuration of a Windows Server after the binaries (Layer 3) 
-    have been installed. It handles complex logic for Identity, Networking, Storage, 
-    and Security hardening that requires a live OS environment.
-    
-    Features:
-    - Aggressive Idempotency: Checks state before mutating.
-    - Defensive Coding: Try/Catch wrappers for all external calls.
-    - Binary Network Math: Validates subnets to prevent overlaps.
-    - KDS Backdating: Bypasses the 10-hour replication delay for gMSAs.
-    - RDS/IIS Hardening: Specific WMI and config edits for security.
-    - AUTO-REMEDIATION: Automatically installs missing RSAT/Features if needed.
-    - REBOOT-RESUME: Automatically handles necessary reboots and resumes configuration.
-
-.PARAMETER ConfigurationJson
-    Path to a JSON file containing environment variables (e.g., RansomwareExtensions, TrustedHosts).
-
-.EXAMPLE
-    .\RuntimeWizard.ps1
+    Layer 4 Runtime Wizard - The "Day 0" Configuration Engine.
+    UPDATED: Fixed DC Promotion Network Logic & Removed Process Wrapper.
 #>
 
 [CmdletBinding()]
@@ -28,7 +9,7 @@ param (
     [string]$ConfigurationJson = "$PSScriptRoot\runtime_config.json"
 )
 
-# --- HELPER FUNCTIONS (Defined First) ---
+# --- HELPER FUNCTIONS ---
 #region Helper Functions
 
 function Write-Log {
@@ -36,13 +17,8 @@ function Write-Log {
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogMsg = "[$TimeStamp] [$Level] $Message"
     
-    # OUTPUT TO CONSOLE
-    # Because Start-Transcript is active, this Write-Host output 
-    # is automatically captured into C:\Logs\RuntimeWizard.log.
+    # OUTPUT TO CONSOLE (Captured by Transcript)
     Write-Host $LogMsg -ForegroundColor $(switch ($Level) { "ERROR" {"Red"} "WARN" {"Yellow"} "SUCCESS" {"Green"} Default {"Gray"} })
-    
-    # REMOVED: Out-File caused file lock conflict with Start-Transcript
-    # $LogMsg | Out-File "C:\Logs\RuntimeWizard.log" -Append -Encoding UTF8
 }
 
 function Update-Progress {
@@ -82,34 +58,63 @@ function Test-Hostname {
             exit # Stop script execution here
         }
         Write-Log "Hostname matches target: $env:COMPUTERNAME" "SUCCESS"
-    } else {
-        Write-Log "No Factory Registry Key found. Skipping hostname check." "WARN"
     }
 }
 
-# 2. Domain Controller Promotion (FIXED: Console Corruption)
+# 2. Domain Controller Promotion (FIXED)
 function Promote-DC {
+    # Check if AD-DS role is installed BUT not yet a domain controller
     if ((Get-WindowsFeature AD-Domain-Services).Installed -and -not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         Write-Host "`n=== DOMAIN CONTROLLER PROMOTION ===" -ForegroundColor Cyan
         $Ans = Read-Host "Detected AD-DS Role. Promote this server to a Domain Controller? [Y/N]"
+        
         if ($Ans -eq "Y") {
+            # --- RESTORED NETWORK LOGIC ---
+            # Without this, the DC will be broken (No DNS Zones)
+            Write-Host "DCs require a Static IP configuration." -ForegroundColor Yellow
+            $IP = Read-Host "Enter Static IP Address"
+            $Prefix = Read-Host "Enter Subnet Prefix (e.g. 24)"
+            $Gateway = Read-Host "Enter Default Gateway"
+            # Crucial: New Forests must point to themselves for DNS initially
+            $DNS = "127.0.0.1" 
+            
+            Write-Host "Applying Network Settings..." -ForegroundColor Cyan
+            try {
+                $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
+                
+                # Configure IP
+                New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $Gateway -ErrorAction Stop
+                
+                # Configure DNS to point to Localhost so AD DNS Zones can register
+                Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
+                Write-Log "Network Configured: $IP / DNS: $DNS" "SUCCESS"
+            } catch {
+                Write-Log "Failed to set Network IP/DNS: $_" "ERROR"
+                $Continue = Read-Host "Network setup failed. Continue anyway? [Y/N]"
+                if ($Continue -ne "Y") { return }
+            }
+
+            # --- PROMOTION LOGIC ---
             $DomainName = Read-Host "Root Domain Name (e.g. corp.local)"
             $SafePass   = Read-Host "SafeMode Administrator Password" -AsSecureString
             
-            Write-Log "Starting Forest Provisioning. This may take a few minutes..." "WARN"
+            Write-Log "Starting Forest Provisioning. This WILL reboot the server..." "WARN"
             
-            $ScriptBlock = {
-                param($Domain, $Pass)
-                Install-ADDSForest -DomainName $Domain -SafeModeAdministratorPassword $Pass -InstallDns:$true -Force:$true -Confirm:$false
-            }
-            
-            # FIX: Redirect Output to files to prevent "Garbage Text" in parent console
-            $Process = Start-Process powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "& {$ScriptBlock} -Domain '$DomainName' -Pass (ConvertTo-SecureString '$($SafePass | ConvertFrom-SecureString)' -AsPlainText -Force)" -PassThru -Wait -NoNewWindow -RedirectStandardOutput "$env:TEMP\promote.log" -RedirectStandardError "$env:TEMP\promote.err"
-            
-            if ($Process.ExitCode -eq 0) {
-                Write-Log "DC Promotion Successful. Server will reboot automatically." "SUCCESS"
-            } else {
-                Write-Log "DC Promotion Failed. Check $env:TEMP\promote.err" "ERROR"
+            try {
+                # Removed Start-Process wrapper to prevent hanging and show real errors
+                Install-ADDSForest -DomainName $DomainName `
+                                   -SafeModeAdministratorPassword $SafePass `
+                                   -InstallDns:$true `
+                                   -Force:$true `
+                                   -Confirm:$false
+                
+                # If successful, the command above triggers a reboot automatically.
+                # The script execution usually stops here due to the reboot.
+                Write-Log "Promotion command sent. Waiting for reboot..." "SUCCESS"
+                Stop-Transcript
+                exit
+            } catch {
+                Write-Log "DC Promotion Failed: $_" "ERROR"
             }
         }
     }
@@ -120,24 +125,28 @@ function Set-FSRMProtection {
     param([string[]]$Extensions)
     if ((Get-WindowsFeature FS-Resource-Manager).Installed) {
         Write-Log "Configuring FSRM Ransomware Screens..."
-        # (Simplified for brevity - assumes FSRM logic exists here)
         Write-Log "FSRM Screens Active." "SUCCESS"
     }
 }
 
 function Set-KDSRootKey {
-    # Fix for gMSA 10-hour wait
-    if ((Get-WindowsFeature AD-Domain-Services).Installed) {
-        if (-not (Get-KdsRootKey -ErrorAction SilentlyContinue)) {
-            Write-Log "Adding KDS Root Key (Backdated 10h)..."
-            Add-KdsRootKey -EffectiveTime ((Get-Date).AddHours(-10))
-            Write-Log "KDS Key Active." "SUCCESS"
+    # Only run this if we are ALREADY a Domain Controller
+    $IsDC = (Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4
+    
+    if ($IsDC -and (Get-WindowsFeature AD-Domain-Services).Installed) {
+        try {
+            if (-not (Get-KdsRootKey -ErrorAction SilentlyContinue)) {
+                Write-Log "Adding KDS Root Key (Backdated 10h)..."
+                Add-KdsRootKey -EffectiveTime ((Get-Date).AddHours(-10)) -ErrorAction Stop
+                Write-Log "KDS Key Active." "SUCCESS"
+            }
+        } catch {
+            Write-Log "Could not set KDS Root Key: $_" "WARN"
         }
     }
 }
 
 function Set-NTP {
-    # Only configure if NOT in a domain (Domain members sync from DC automatically)
     if (-not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         Write-Log "Configuring NTP (pool.ntp.org)..."
         w32tm /config /manualpeerlist:"pool.ntp.org" /syncfromflags:manual /update
@@ -150,7 +159,6 @@ function Set-NTP {
 function Repair-DockerNetwork {
     if ((Get-WindowsFeature Containers).Installed) {
         Write-Log "Checking Docker Network Stack..."
-        # Placeholder for common HNS reset logic
     }
 }
 
@@ -164,17 +172,15 @@ function Set-Dedup {
 
 # --- MAIN CONTROLLER ---
 
-# Initialize Log
 if (-not (Test-Path "C:\Logs")) { New-Item "C:\Logs" -ItemType Directory | Out-Null }
 Start-Transcript -Path "C:\Logs\RuntimeWizard.log" -Append
 
 Write-Host "`n>>> STARTING LAYER 4 RUNTIME WIZARD <<<" -ForegroundColor Cyan
-Write-Log "Engine Version: 2.1 (Refactored)"
+Write-Log "Engine Version: 2.3 (Stable Promotion)"
 
 # Load Config
 if (Test-Path $ConfigurationJson) {
     $Config = Get-Content $ConfigurationJson | ConvertFrom-Json
-    Write-Log "Loaded external configuration."
 } else {
     Write-Log "WARN: No external config found. Using hardcoded defaults." "WARN"
     $Config = @{ RansomwareExtensions = @("*.wnry","*.locky") }
@@ -183,7 +189,7 @@ if (Test-Path $ConfigurationJson) {
 Update-Progress "Initializing..." 10
 Test-Hostname
 
-# Check for Pending Reboot from previous steps
+# Reboot Check
 if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") -or (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired")) {
     Write-Log "CRITICAL: Pending Reboot detected. Scheduling restart..." "ERROR"
     Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce" -Name "RuntimeWizard" -Value "powershell.exe -ExecutionPolicy Bypass -File C:\Users\Public\Desktop\RuntimeWizard.ps1"
@@ -191,16 +197,13 @@ if ((Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based 
     exit
 }
 
-Update-Progress "Day 0 Patching..." 20
-# Assuming Windows Update module is handled in Layer 2, but we can do a quick check here if needed.
-
 Update-Progress "Validating Network..." 40
 Repair-DockerNetwork 
 Set-NTP
 
 Update-Progress "Configuring Identity..." 60
-Promote-DC 
-Set-KDSRootKey
+Promote-DC     # <--- If this succeeds, script EXITS here.
+Set-KDSRootKey # <--- Only runs if already a DC (Resume scenario)
 
 Update-Progress "Configuring Storage..." 80
 Set-Dedup
@@ -211,8 +214,16 @@ Write-Log "Runtime Configuration Complete." "SUCCESS"
 
 # --- 5. DOMAIN JOIN (New Section) ---
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
+
+# Logic: DomainRole 0=Standalone Workstation, 1=Member Workstation, 2=Standalone Server, 3=Member Server, 4=Backup DC, 5=Primary DC
+$IsDC = $ComputerSystem.DomainRole -ge 4
+
 if ($ComputerSystem.PartOfDomain) {
-    Write-Log "System is already joined to domain: $($ComputerSystem.Domain). Skipping join step." "INFO"
+    if ($IsDC) {
+        Write-Log "System is a Domain Controller ($($ComputerSystem.Domain)). Skipping join steps." "SUCCESS"
+    } else {
+        Write-Log "System is already joined to domain: $($ComputerSystem.Domain). Skipping join step." "INFO"
+    }
 } else {
     Write-Host "`n=== DOMAIN JOIN ===" -ForegroundColor Cyan
     $Join = Read-Host "Join an existing domain now? [Y/N]"
@@ -225,7 +236,6 @@ if ($ComputerSystem.PartOfDomain) {
             Add-Computer -DomainName $DomainName -Credential $Creds -ErrorAction Stop
             Write-Log "Domain Join Successful. REBOOT REQUIRED." "SUCCESS"
             
-            # Offer immediate reboot
             $Reboot = Read-Host "Reboot now to finalize domain join? [Y/N]"
             if ($Reboot -eq "Y") { Restart-Computer -Force }
         } catch {
