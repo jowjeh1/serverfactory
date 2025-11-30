@@ -35,9 +35,9 @@ source "hyperv-vmcx" "patch" {
 build {
   sources = ["source.hyperv-vmcx.patch"]
 
-  # --- PASS 1: CRITICAL / SERVICING STACK UPDATES ---
+  # --- PASS 1: CRITICAL / SERVICING STACK ---
   provisioner "powershell" {
-    script = "scripts/update.ps1"
+    script            = "scripts/update.ps1"
     elevated_user     = "Administrator"
     elevated_password = "P@ssw0rd123!"
   }
@@ -46,39 +46,28 @@ build {
   # --- PASS 2: CUMULATIVE UPDATES ---
   provisioner "powershell" {
     # Added 2m pause to allow Windows Update service to stabilize after reboot
-    pause_before = "2m"
-    script = "scripts/update.ps1"
+    pause_before      = "2m"
+    script            = "scripts/update.ps1"
     elevated_user     = "Administrator"
     elevated_password = "P@ssw0rd123!"
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # --- PASS 3: .NET / DRIVERS / OPTIONAL ---
+  # --- PASS 3: FINAL SWEEP (.NET / DRIVERS) ---
   provisioner "powershell" {
-    pause_before = "2m"
-    script = "scripts/update.ps1"
+    pause_before      = "2m"
+    script            = "scripts/update.ps1"
     elevated_user     = "Administrator"
     elevated_password = "P@ssw0rd123!"
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # --- PASS 4: FINAL CHECK (Should be 0 Updates) ---
-  provisioner "powershell" {
-    pause_before = "2m"
-    script = "scripts/update.ps1"
-    elevated_user     = "Administrator"
-    elevated_password = "P@ssw0rd123!"
-  }
-  provisioner "windows-restart" { restart_timeout = "30m" }
-
-  # --- FINAL CLEANUP & SYSPREP ---
+  # --- CLEANUP (No 4th pass, just cleanup) ---
   provisioner "powershell" {
     inline = [
-      "Write-Host '--- Starting Final Cleanup ---'",
-      "Write-Host 'Cleaning up temp files...'",
-      "Remove-Item -Path $env:TEMP\\* -Recurse -Force -ErrorAction SilentlyContinue",
-      "Clear-EventLog -LogName Application, Security, System",
-      "Write-Host 'Cleanup complete. Packer will now run Sysprep to shutdown.'"
+      "Write-Host 'Cleaning up Update Cache...'",
+      "Remove-Item -Path $env:TEMP\\* -Recurse -Force -EA 0",
+      "Clear-EventLog -LogName Application, Security, System"
     ]
   }
 }
