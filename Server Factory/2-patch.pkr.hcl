@@ -7,27 +7,23 @@ packer {
   }
 }
 
-# NOTE: We use "hyperv-vmcx" builder to clone an existing VM
 source "hyperv-vmcx" "patch" {
-  # --- INPUT ---
-  clone_from_vmcx_path = "C:\\Packer-Demo\\builds\\base"
+  # --- DYNAMIC PATH FIX ---
+  # OLD: clone_from_vmcx_path = "C:\\Packer-Demo\\builds\\base"
+  # NEW: Uses ${path.root} to find the base image in the current project folder
+  clone_from_vmcx_path = "${path.root}/builds/base"
   
-  # --- OUTPUT ---
   vm_name          = "Server2022-Golden-Patched"
   output_directory = "builds/golden"
   switch_name      = "Default Switch"
-  
-  # --- HEADLESS MODE ---
   headless         = false
-
-  # --- WINRM ---
+  
   communicator   = "winrm"
   winrm_username = "Administrator"
   winrm_password = "P@ssw0rd123!"
   winrm_timeout  = "30m"
   winrm_insecure = true
   
-  # --- SHUTDOWN STRATEGY ---
   shutdown_command = "C:\\Windows\\System32\\Sysprep\\sysprep.exe /generalize /oobe /shutdown /quiet /mode:vm"
   shutdown_timeout = "60m"
 }
@@ -35,7 +31,7 @@ source "hyperv-vmcx" "patch" {
 build {
   sources = ["source.hyperv-vmcx.patch"]
 
-  # --- PASS 1: CRITICAL / SERVICING STACK ---
+  # Pass 1
   provisioner "powershell" {
     script            = "scripts/update.ps1"
     elevated_user     = "Administrator"
@@ -43,17 +39,7 @@ build {
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # --- PASS 2: CUMULATIVE UPDATES ---
-  provisioner "powershell" {
-    # Added 2m pause to allow Windows Update service to stabilize after reboot
-    pause_before      = "2m"
-    script            = "scripts/update.ps1"
-    elevated_user     = "Administrator"
-    elevated_password = "P@ssw0rd123!"
-  }
-  provisioner "windows-restart" { restart_timeout = "30m" }
-
-  # --- PASS 3: FINAL SWEEP (.NET / DRIVERS) ---
+  # Pass 2
   provisioner "powershell" {
     pause_before      = "2m"
     script            = "scripts/update.ps1"
@@ -62,10 +48,18 @@ build {
   }
   provisioner "windows-restart" { restart_timeout = "30m" }
 
-  # --- CLEANUP (No 4th pass, just cleanup) ---
+  # Pass 3
+  provisioner "powershell" {
+    pause_before      = "2m"
+    script            = "scripts/update.ps1"
+    elevated_user     = "Administrator"
+    elevated_password = "P@ssw0rd123!"
+  }
+  provisioner "windows-restart" { restart_timeout = "30m" }
+
+  # Cleanup
   provisioner "powershell" {
     inline = [
-      "Write-Host 'Cleaning up Update Cache...'",
       "Remove-Item -Path $env:TEMP\\* -Recurse -Force -EA 0",
       "Clear-EventLog -LogName Application, Security, System"
     ]

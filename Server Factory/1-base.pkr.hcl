@@ -8,8 +8,9 @@ packer {
 }
 
 source "hyperv-iso" "base" {
-  # --- INPUTS ---
-  iso_url        = "C:\\Packer-Demo\\ISO\\WS2022.iso"
+  # --- DYNAMIC PATHS ---
+  # ${path.root} refers to the folder containing this .hcl file
+  iso_url        = "${path.root}/ISO/WS2022.iso"
   iso_checksum   = "none"
   switch_name    = "Default Switch"
   
@@ -35,24 +36,17 @@ source "hyperv-iso" "base" {
   headless       = false
   cd_files       = ["Autounattend.xml"]
   
-  # --- SHUTDOWN STRATEGY ---
-  # Packer runs this command automatically AFTER provisioning is done.
-  # This shuts down the VM gracefully so Packer can export the VHDX.
-  shutdown_command = "shutdown /s /t 10 /f /d p:4:1"
+  shutdown_command = "powershell -executionpolicy bypass -file scripts/shutdown.ps1"
   shutdown_timeout = "30m"
 }
 
 build {
   sources = ["source.hyperv-iso.base"]
-
-  # 1. Setup WinRM (Standard)
+  
   provisioner "powershell" {
     inline = [
       "winrm quickconfig -q",
       "Set-Service -Name WinRM -StartupType Automatic -Status Running"
     ]
   }
-
-  # REMOVED: The manual shutdown script. 
-  # We let the 'shutdown_command' above handle it automatically.
 }
