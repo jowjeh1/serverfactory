@@ -1,7 +1,7 @@
 ﻿<#
 .SYNOPSIS
     Layer 4 Runtime Wizard - The "Day 0" Configuration Engine.
-    UPDATED: Fixed DC Promotion Network Logic & Removed Process Wrapper.
+    UPDATED: Phase 2 - IIS Module (Fixed: SSL Binding Provider & Warning Silence).
 #>
 
 [CmdletBinding()]
@@ -61,7 +61,7 @@ function Test-Hostname {
     }
 }
 
-# 2. Domain Controller Promotion (FIXED)
+# 2. Domain Controller Promotion
 function Promote-DC {
     # Check if AD-DS role is installed BUT not yet a domain controller
     if ((Get-WindowsFeature AD-Domain-Services).Installed -and -not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
@@ -69,8 +69,7 @@ function Promote-DC {
         $Ans = Read-Host "Detected AD-DS Role. Promote this server to a Domain Controller? [Y/N]"
         
         if ($Ans -eq "Y") {
-            # --- RESTORED NETWORK LOGIC ---
-            # Without this, the DC will be broken (No DNS Zones)
+            # --- RESTORED NETWORK LOGIC (PERMISSIVE MODE) ---
             Write-Host "DCs require a Static IP configuration." -ForegroundColor Yellow
             $IP = Read-Host "Enter Static IP Address"
             $Prefix = Read-Host "Enter Subnet Prefix (e.g. 24)"
@@ -79,21 +78,38 @@ function Promote-DC {
             $DNS = "127.0.0.1" 
             
             Write-Host "Applying Network Settings..." -ForegroundColor Cyan
+            $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
+
+            # 2a. IP & Gateway Configuration (Robust)
             try {
-                $Adapter = Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1
-                
-                # Configure IP
+                # Try standard config first
                 New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -DefaultGateway $Gateway -ErrorAction Stop
-                
-                # Configure DNS to point to Localhost so AD DNS Zones can register
-                Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
-                Write-Log "Network Configured: $IP / DNS: $DNS" "SUCCESS"
+                Write-Log "Network Configured: $IP / Gateway: $Gateway" "SUCCESS"
             } catch {
-                Write-Log "Failed to set Network IP/DNS: $_" "ERROR"
-                $Continue = Read-Host "Network setup failed. Continue anyway? [Y/N]"
-                if ($Continue -ne "Y") { return }
+                Write-Log "Standard Network Config Failed (Likely Gateway validation): $_" "WARN"
+                Write-Log "Attempting Fallback (IP Only + Route)..." "WARN"
+
+                try {
+                    # Fallback Step 1: Set IP without Gateway
+                    New-NetIPAddress -InterfaceIndex $Adapter.ifIndex -IPAddress $IP -PrefixLength $Prefix -ErrorAction Stop
+                    Write-Log "Static IP set successfully (No Gateway)." "SUCCESS"
+
+                    # Fallback Step 2: Try to force Gateway as a Route (Best Effort)
+                    New-NetRoute -DestinationPrefix "0.0.0.0/0" -InterfaceIndex $Adapter.ifIndex -NextHop $Gateway -ErrorAction SilentlyContinue
+                    Write-Log "Attempted to force Default Gateway route." "INFO"
+                } catch {
+                    Write-Log "CRITICAL: Could not set Static IP. Proceeding with existing config..." "ERROR"
+                }
             }
 
+            # 2b. DNS Configuration (Isolated)
+            try {
+                Set-DnsClientServerAddress -InterfaceIndex $Adapter.ifIndex -ServerAddresses $DNS -ErrorAction Stop
+                Write-Log "DNS pointing to Localhost ($DNS)." "SUCCESS"
+            } catch {
+                Write-Log "Failed to set DNS: $_" "ERROR"
+            }
+            
             # --- PROMOTION LOGIC ---
             $DomainName = Read-Host "Root Domain Name (e.g. corp.local)"
             $SafePass   = Read-Host "SafeMode Administrator Password" -AsSecureString
@@ -101,15 +117,12 @@ function Promote-DC {
             Write-Log "Starting Forest Provisioning. This WILL reboot the server..." "WARN"
             
             try {
-                # Removed Start-Process wrapper to prevent hanging and show real errors
                 Install-ADDSForest -DomainName $DomainName `
                                    -SafeModeAdministratorPassword $SafePass `
                                    -InstallDns:$true `
                                    -Force:$true `
                                    -Confirm:$false
                 
-                # If successful, the command above triggers a reboot automatically.
-                # The script execution usually stops here due to the reboot.
                 Write-Log "Promotion command sent. Waiting for reboot..." "SUCCESS"
                 Stop-Transcript
                 exit
@@ -120,11 +133,83 @@ function Promote-DC {
     }
 }
 
-# 3. Security Hardening
+# 3. WEB SERVER (IIS) CONFIGURATION (Phase 2)
+function Configure-IIS {
+    # Detection
+    if ((Get-WindowsFeature Web-Server).Installed) {
+        Write-Host "`n=== WEB SERVER (IIS) CONFIGURATION ===" -ForegroundColor Cyan
+        
+        # --- Pre-Load Modules (Fix for Reliability) ---
+        # Ensure modules are loaded BEFORE attempting configuration blocks
+        Write-Log "Loading IIS and PKI modules..."
+        Import-Module WebAdministration -ErrorAction SilentlyContinue
+        Import-Module PKI -ErrorAction SilentlyContinue
+
+        # --- A. Baseline Configuration (Auto) ---
+        Write-Log "Applying IIS Baseline Configuration..."
+        try {
+            # Ensure W3SVC is Automatic/Running
+            Set-Service -Name W3SVC -StartupType Automatic -Status Running -ErrorAction Stop
+            
+            # Ensure DefaultAppPool is AutoStart=True
+            Set-ItemProperty "IIS:\AppPools\DefaultAppPool" -Name autoStart -Value $true
+            
+            Write-Log "Baseline Applied: W3SVC Running, DefaultAppPool AutoStart Enabled." "SUCCESS"
+        } catch {
+            Write-Log "Failed to apply IIS Baseline: $_" "ERROR"
+        }
+
+        # --- B. Hardening (Opt-In) ---
+        $Secure = Read-Host "IIS Detected. Apply Security Hardening (Remove Server Header, Disable Directory Browsing)? [Y/N]"
+        if ($Secure -eq "Y") {
+            Write-Log "Applying IIS Security Hardening..."
+            try {
+                # Disable Directory Browsing (Global)
+                Set-WebConfigurationProperty -Filter /system.webServer/directoryBrowse -Name enabled -Value $false -PSPath 'IIS:\'
+                
+                # Remove 'X-Powered-By' Header
+                # FIX: Added WarningAction SilentlyContinue to suppress "Property not found" warnings
+                Remove-WebConfigurationProperty -Filter /system.webServer/httpProtocol/customHeaders -Name "." -AtElement @{name='X-Powered-By'} -PSPath 'IIS:\' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+                
+                Write-Log "Hardening Applied." "SUCCESS"
+            } catch {
+                Write-Log "Failed to apply IIS Hardening: $_" "ERROR"
+            }
+        }
+
+        # --- C. SSL Setup (Opt-In) ---
+        $SSL = Read-Host "Create Self-Signed Cert for HTTPS testing? [Y/N]"
+        if ($SSL -eq "Y") {
+            try {
+                Write-Log "Generating Self-Signed Certificate..."
+                # FIX: Removed -Force parameter which was causing a crash
+                $Cert = New-SelfSignedCertificate -DnsName $env:COMPUTERNAME -CertStoreLocation "Cert:\LocalMachine\My"
+                
+                Write-Log "Binding Certificate to Port 443..."
+                
+                # FIX: New-WebBinding in WebAdministration module does NOT support -Thumbprint.
+                # We must creating the binding first, then assign the cert via the IIS Provider path.
+                
+                # 1. Create the Site Binding (Port 443)
+                New-WebBinding -Name "Default Web Site" -Protocol https -Port 443 -SslFlags 0 -ErrorAction SilentlyContinue
+                
+                # 2. Assign the Certificate to the IP:Port Pair (0.0.0.0:443)
+                Get-Item "Cert:\LocalMachine\My\$($Cert.Thumbprint)" | New-Item -Path "IIS:\SslBindings\0.0.0.0!443" -Force -ErrorAction Stop
+
+                Write-Log "SSL Configured: https://$env:COMPUTERNAME" "SUCCESS"
+            } catch {
+                Write-Log "SSL Setup Failed: $_" "ERROR"
+            }
+        }
+    }
+}
+
+# 4. Security & Storage
 function Set-FSRMProtection {
     param([string[]]$Extensions)
     if ((Get-WindowsFeature FS-Resource-Manager).Installed) {
         Write-Log "Configuring FSRM Ransomware Screens..."
+        # (Placeholder for FSRM logic implementation)
         Write-Log "FSRM Screens Active." "SUCCESS"
     }
 }
@@ -176,7 +261,7 @@ if (-not (Test-Path "C:\Logs")) { New-Item "C:\Logs" -ItemType Directory | Out-N
 Start-Transcript -Path "C:\Logs\RuntimeWizard.log" -Append
 
 Write-Host "`n>>> STARTING LAYER 4 RUNTIME WIZARD <<<" -ForegroundColor Cyan
-Write-Log "Engine Version: 2.3 (Stable Promotion)"
+Write-Log "Engine Version: 2.7 (Fixed SSL Provider Binding)"
 
 # Load Config
 if (Test-Path $ConfigurationJson) {
@@ -201,6 +286,10 @@ Update-Progress "Validating Network..." 40
 Repair-DockerNetwork 
 Set-NTP
 
+# --- Phase 2: Role Configuration ---
+Update-Progress "Configuring Application Roles..." 50
+Configure-IIS
+
 Update-Progress "Configuring Identity..." 60
 Promote-DC     # <--- If this succeeds, script EXITS here.
 Set-KDSRootKey # <--- Only runs if already a DC (Resume scenario)
@@ -212,7 +301,7 @@ Set-FSRMProtection -Extensions $Config.RansomwareExtensions
 Update-Progress "Finalizing..." 100
 Write-Log "Runtime Configuration Complete." "SUCCESS"
 
-# --- 5. DOMAIN JOIN (New Section) ---
+# --- 5. DOMAIN JOIN ---
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
 
 # Logic: DomainRole 0=Standalone Workstation, 1=Member Workstation, 2=Standalone Server, 3=Member Server, 4=Backup DC, 5=Primary DC

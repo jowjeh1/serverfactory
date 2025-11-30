@@ -136,11 +136,6 @@
                     <CommandLine>cmd.exe /c winrm set winrm/config/service/auth @{Basic="true"}</CommandLine>
                     <Description>WinRM Allow Basic Auth</Description>
                 </SynchronousCommand>
-                <SynchronousCommand wcm:action="add">
-                    <Order>5</Order>
-                    <CommandLine>powershell -ExecutionPolicy Bypass -Command "Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False"</CommandLine>
-                    <Description>Disable Firewall (Demo)</Description>
-                </SynchronousCommand>
             </FirstLogonCommands>
         </component>
     </settings>
