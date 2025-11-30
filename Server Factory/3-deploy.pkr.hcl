@@ -9,9 +9,25 @@ packer {
 
 variable "role" { type = string }
 variable "vm_name" { type = string }
-variable "vm_ram" { type = number }
-variable "vm_cpu" { type = number }
-# FIX: Added switch_name variable to accept input from build.ps1
+
+# UPDATED: Validation for CPU
+variable "vm_cpu" { 
+  type = number
+  validation {
+    condition     = contains([2, 4, 8, 12], var.vm_cpu)
+    error_message = "The vm_cpu value must be one of: 2, 4, 8, 12."
+  }
+}
+
+# UPDATED: Validation for RAM
+variable "vm_ram" { 
+  type = number 
+  validation {
+    condition     = contains([2048, 4096, 8192, 16384], var.vm_ram)
+    error_message = "The vm_ram value must be one of: 2048, 4096, 8192, 16384."
+  }
+}
+
 variable "switch_name" { 
   type    = string 
   default = "Default Switch" 
@@ -25,7 +41,6 @@ source "hyperv-vmcx" "deploy" {
   vm_name          = "${var.vm_name}"
   cpus             = var.vm_cpu
   memory           = var.vm_ram
-  # FIX: Use the variable instead of hardcoded string
   switch_name      = var.switch_name
   headless         = false
   

@@ -1,6 +1,6 @@
 ﻿# scripts/build.ps1
 # Enterprise Server Factory - Layer 3 Wrapper
-# UPDATED: Dynamic Network Switch Selection
+# UPDATED: Expanded Hardware Options & Switch Selection
 
 # 1. Set Context to Project Root
 $ScriptDir = $PSScriptRoot
@@ -30,13 +30,15 @@ Write-Host "`n[1] Configuration"
 $VMName = Read-Host "    Hostname (Default: Server2022-L3)"
 if ([string]::IsNullOrWhiteSpace($VMName)) { $VMName = "Server2022-L3" }
 
-$CPU = Read-Host "    vCPU (Default: 2)"
+# UPDATED: vCPU Selection
+$CPU = Read-Host "    vCPU (Default: 2. Options: 2, 4, 8, 12)"
 if ([string]::IsNullOrWhiteSpace($CPU)) { $CPU = "2" }
 
-$RAM = Read-Host "    RAM MB (Default: 4096)"
+# UPDATED: RAM Selection
+$RAM = Read-Host "    RAM MB (Default: 4096. Options: 2048, 4096, 8192, 16384)"
 if ([string]::IsNullOrWhiteSpace($RAM)) { $RAM = "4096" }
 
-# --- SWITCH SELECTION (NEW) ---
+# --- SWITCH SELECTION ---
 Write-Host "`n[2] Network Configuration"
 $Switches = Get-VMSwitch | Select-Object Name
 $SwitchName = "Default Switch" # Fallback
@@ -76,7 +78,7 @@ if (-not (Test-Path ".\packer.exe")) {
     exit
 }
 
-# Run Packer (Added switch_name variable)
+# Run Packer (Passing all variables)
 $PackerCmd = ".\packer.exe build -force -var 'role=$Role' -var 'vm_name=$VMName' -var 'vm_cpu=$CPU' -var 'vm_ram=$RAM' -var 'switch_name=$SwitchName' 3-deploy.pkr.hcl"
 Invoke-Expression $PackerCmd
 
