@@ -4,13 +4,15 @@ SERVER FACTORY: Project Context & AI Instructions
 
 READ THIS FIRST.
 This repository contains a "Server Factory" pipeline for automating Windows Server 2022 builds using HashiCorp Packer and Hyper-V.
-Your goal is to maintain the integrity of the 4-Layer Architecture and strict Change Control protocols.
+Your goal is to maintain the integrity of the 4-Layer Architecture, the "Opt-In" configuration philosophy, and the strict Change Control protocols.
 
-1. Project Architecture (The "4 Layers")
+Project Architecture (The "4 Layers")
 
-We do not build monolithic images. We build layered artifacts to ensure speed and modularity.
+We do not build monolithic images. We build layered artifacts to ensure speed, modularity, and resilience.
 
-Layer 1 (Base): * Input: Raw ISO (ISO/WS2022.iso).
+Layer 1 (Base):
+
+Input: Raw ISO (ISO/WS2022.iso).
 
 Output: Raw VHDX with OS installed.
 
@@ -32,9 +34,9 @@ Layer 3 (Factory):
 
 Input: Golden Image.
 
-Action: Installs Role Binaries (IIS, AD-DS, etc.) but DOES NOT configure them.
+Action: Installs Role Binaries (IIS, AD-DS, Containers, etc.).
 
-Mechanism: Seeds the target Hostname into the Registry (HKLM:\Software\ServerFactory) to survive Sysprep.
+Critical Mechanism: Seeds BOTH the target Hostname AND the Server Role into the Registry (HKLM:\Software\ServerFactory) to survive Sysprep.
 
 Output: Final VM Artifact imported into Hyper-V.
 
@@ -44,81 +46,96 @@ Layer 4 (Runtime):
 
 Input: The live, booted VM from Layer 3.
 
-Action: "Day 0" Configuration (Identity, IP, Domain Join, Security).
+Action: "Day 0" Configuration Engine (Identity, Network, Role Configuration, Security).
 
-Tool: PowerShell Script (RuntimeWizard.ps1) runs on first login.
+Mechanism: Runs once on first login via RunOnce registry key.
 
-2. Critical Engineering Constraints (DO NOT BREAK)
+Tool: PowerShell Script (RuntimeWizard.ps1).
 
-A. Hostname Persistence
+Critical Engineering Constraints (DO NOT BREAK)
 
-Problem: Sysprep wipes C:\ProgramData and standard config files.
+A. Hostname & Role Persistence (The "Registry Intent" Pattern)
 
-Solution: We store the target hostname in registry key HKLM:\Software\ServerFactory\TargetName during Layer 3. Layer 4 reads this key to rename the computer.
+Problem: Sysprep /generalize wipes C:\ProgramData and often strips feature flags (specifically Containers/Hyper-V status).
 
-B. DC Promotion Logic (Fragile)
+Solution: We persist the "Intent" in the Registry during Layer 3.
 
-Constraint: Promoting a Domain Controller requires a reboot.
+Path: HKLM:\Software\ServerFactory
 
-Mechanism: RuntimeWizard.ps1 calls Install-ADDSForest.
+Keys: 'TargetName' and 'ServerRole'.
 
-Current State: We run this command directly (removed Start-Process wrappers) to allow the native Windows restart sequence to occur naturally. The script waits 300 seconds for the OS to kill the process during shutdown. Do not add explicit exit or Restart-Computer commands immediately after promotion, as this race condition breaks the promotion commit.
+Layer 4 Logic: Always check Get-StoredRole (Registry) first. If the Registry says "ContainerHost" but the feature is missing, trigger Self-Healing (reinstall + reboot).
 
-C. Network Configuration
+B. The "Opt-In" Hardening Rule
 
-Constraint: DC Promotion requires a Static IP/DNS before the promotion command runs.
+Constraint: The Runtime Wizard must NEVER automatically apply breaking changes (Firewalls, Disabling Protocols, AppLocker).
 
-Logic: The Configure-Network function is triggered only inside the Promote-DC block. Standard member servers default to DHCP.
+Pattern: Detect the Role -> PROMPT the User -> Apply only if [Y].
 
-D. Update Stability
+Example: "IIS Detected. Apply Security Hardening? [Y/N]".
 
-Constraint: Windows Updates often fail if the service stops unexpectedly.
+C. DC Promotion Logic (Fragile)
 
-Logic: scripts/update.ps1 uses a retry loop (up to 3 attempts) and self-healing logic (restarting wuauserv) if scanning fails.
+Constraint: Promoting a DC requires a reboot and specific DNS settings.
 
-E. Portability
+Logic:
 
-Constraint: The project must run from any folder.
+Set IP/DNS (Pre-Flight).
 
-Solution: All Packer templates use ${path.root}. The PowerShell wrapper (build.ps1) explicitly sets $PSScriptRoot as the working directory.
+Install-ADDSForest (No Start-Process wrapper).
 
-3. Directory Structure Map
+Allow the command to reboot the server naturally.
+
+Self-Reference: DCs must enforce DNS = 127.0.0.1.
+
+D. Dynamic Networking
+
+Layer 3: build.ps1 dynamically scans for Hyper-V switches and passes the selection to Packer.
+
+Layer 4: RuntimeWizard.ps1 performs DNS Pre-Flight checks before Domain Joining to prevent timeout errors.
+
+Runtime Modules (Layer 4 Capabilities)
+
+The RuntimeWizard.ps1 engine is modular. It supports the following roles based on Registry Intent:
+
+Web (IIS): Configures AppPools, Prompts for Hardening (Headers), Prompts for Self-Signed SSL.
+
+ContainerHost: Robust detection (Registry/Service/Feature). Prompts for NAT Network creation and Docker storage. Includes Self-Healing if Sysprep stripped the feature.
+
+FileServer: Prompts for FSRM Ransomware Screens (if FSRM installed) and SMB Hardening (Disable SMBv1).
+
+RDS: Prompts for Session Timeouts (Idle/Disconnect) and Security Layer (NLA/SSL).
+
+DC: Prompts for Forest Mode and Static IP.
+
+Directory Structure Map
 
 / (Root)
-├── packer.exe              # Local binary (required)
+├── packer.exe              # Local binary
 ├── *.pkr.hcl               # Packer Templates (Layers 1-3)
-├── Autounattend.xml        # Boot configuration for Layer 1
-├── Unattend.xml            # Sysprep answer file for Layer 3
+├── Autounattend.xml        # Boot config (WinRM enabled, Firewall enabled)
+├── Unattend.xml            # Sysprep answer file
 │
 ├── scripts/
-│   ├── build.ps1           # MASTER WRAPPER: Run this to start the build.
-│   ├── update.ps1          # Robust update logic.
-│   ├── deploy-config.ps1   # Layer 3 role injection.
-│   └── RuntimeWizard.ps1   # Layer 4 "Day 0" logic (The brain).
+│   ├── build.ps1           # MASTER WRAPPER: Handles inputs (CPU/RAM/Switch) and runs Packer.
+│   ├── update.ps1          # Robust update logic (3-Pass).
+│   ├── deploy-config.ps1   # Layer 3: Installs Binaries & Seeds Registry.
+│   └── RuntimeWizard.ps1   # Layer 4: The Configuration Engine.
 │
 └── tools/Oscdimg/          # Dependency for creating ISOs
 
-
-4. Change Control Policy
-
-Strict Validation Required.
-
-Do not refactor working logic without explicit authorization.
-
-If a bug is found, propose the fix first.
-
-Always check RuntimeWizard.ps1 against the "Critical Constraints" above before modifying.
-
-5. How to Run (Standard Operating Procedure)
+Standard Operating Procedure
 
 Open PowerShell as Administrator.
 
-Navigate to the project root.
-
 Run .\scripts\build.ps1.
 
-Follow the interactive menu to select Hostname and Role.
+Select Hardware: Choose vCPU (2,4,8,12) and RAM (2GB-16GB).
 
-Wait for the VM to auto-import into Hyper-V.
+Select Network: Script detects Hyper-V switches; choose the target.
 
-Connect to the VM to watch the RuntimeWizard complete the setup.
+Select Role: (Web, DC, File, RDS, Container, Mgmt).
+
+Build: Wait for Packer to create the VM and import it.
+
+Runtime: Connect to the VM console. The Wizard runs automatically. Follow the interactive prompts.
