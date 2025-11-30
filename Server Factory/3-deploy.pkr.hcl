@@ -1,12 +1,3 @@
-packer {
-  required_plugins {
-    hyperv = {
-      source  = "github.com/hashicorp/hyperv"
-      version = ">= 1.0.0"
-    }
-  }
-}
-
 variable "role" { type = string }
 variable "vm_name" { type = string }
 

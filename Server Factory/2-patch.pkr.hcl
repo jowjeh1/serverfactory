@@ -1,12 +1,3 @@
-packer {
-  required_plugins {
-    hyperv = {
-      source  = "github.com/hashicorp/hyperv"
-      version = ">= 1.0.0"
-    }
-  }
-}
-
 source "hyperv-vmcx" "patch" {
   # --- DYNAMIC PATHS ---
   # Uses ${path.root} to find the base image in the current project folder

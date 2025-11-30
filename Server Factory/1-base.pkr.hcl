@@ -1,12 +1,3 @@
-packer {
-  required_plugins {
-    hyperv = {
-      source  = "github.com/hashicorp/hyperv"
-      version = ">= 1.0.0"
-    }
-  }
-}
-
 source "hyperv-iso" "base" {
   # --- DYNAMIC PATHS ---
   # ${path.root} refers to the folder containing this .hcl file
