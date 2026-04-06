@@ -1,0 +1,13 @@
+
+
+# Agent temporary files
+.agent/costs/*.tmp
+.agent/memory/archive/*.tmp
+
+# Windows reserved device names (OpenClaw PTY leak protection)
+nul
+con
+prn
+aux
+com[1-9]
+lpt[1-9]
